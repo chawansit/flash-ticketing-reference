@@ -1,0 +1,169 @@
+name: flash-ticketing
+x-app: &app
+  build: .
+  environment: &env
+    DATABASE_URL: postgresql://ticketing:ticketing@pgbouncer:5432/ticketing
+    REDIS_URL: redis://redis:6379/0
+    KAFKA_BOOTSTRAP: kafka:9092
+    API_URL: http://api:8000
+    ENVIRONMENT: ${ENVIRONMENT:-development}
+    JWT_SECRET: ${JWT_SECRET:-local-development-secret-change-me}
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-webhook-secret-change-me}
+    HOLD_SECONDS: ${HOLD_SECONDS:-120}
+    DB_POOL_MAX: ${DB_POOL_MAX:-12}
+    RESERVE_CONCURRENCY: ${RESERVE_CONCURRENCY:-12}
+    RESERVATION_MODE: ${RESERVATION_MODE:-postgres}
+    REDIS_RESERVE_CONCURRENCY: ${REDIS_RESERVE_CONCURRENCY:-128}
+    REDIS_RESERVATION_REPLICA_ACKS: ${REDIS_RESERVATION_REPLICA_ACKS:-0}
+    REDIS_RESERVATION_WAIT_MS: ${REDIS_RESERVATION_WAIT_MS:-100}
+    REDIS_RESERVATION_MAX_BACKLOG: ${REDIS_RESERVATION_MAX_BACKLOG:-10000}
+    PUBLISHER_BATCH_SIZE: ${PUBLISHER_BATCH_SIZE:-32}
+    SIMULATOR_CONCURRENCY: ${SIMULATOR_CONCURRENCY:-4}
+    REFRESH_COOLDOWN_MS: ${REFRESH_COOLDOWN_MS:-250}
+    REFRESH_BATCH_SIZE: ${REFRESH_BATCH_SIZE:-2}
+    EXPIRY_BATCH_SIZE: ${EXPIRY_BATCH_SIZE:-8}
+    RECONCILE_INTERVAL_SECONDS: ${RECONCILE_INTERVAL_SECONDS:-20}
+    RECONCILE_WINDOW_SECONDS: ${RECONCILE_WINDOW_SECONDS:-300}
+    RECONCILE_BATCH_SIZE: ${RECONCILE_BATCH_SIZE:-8}
+    RECONCILE_BUDGET_MS: ${RECONCILE_BUDGET_MS:-500}
+    RECONCILE_LEASE_SECONDS: ${RECONCILE_LEASE_SECONDS:-30}
+    RECONCILE_BACKOFF_MS: ${RECONCILE_BACKOFF_MS:-1000}
+    RECONCILE_SEED_BATCH: ${RECONCILE_SEED_BATCH:-200}
+  restart: unless-stopped
+  depends_on:
+    migrate: {condition: service_completed_successfully}
+    redis: {condition: service_healthy}
+    kafka: {condition: service_healthy}
+    pgbouncer: {condition: service_started}
+services:
+  postgres:
+    image: postgres:17.6
+    environment:
+      POSTGRES_USER: ticketing
+      POSTGRES_PASSWORD: ticketing
+      POSTGRES_DB: ticketing
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    command: ["postgres", "-c", "max_connections=100", "-c", "log_lock_waits=on", "-c", "deadlock_timeout=100ms"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ticketing"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    environment:
+      DB_HOST: postgres
+      DB_USER: ticketing
+      DB_PASSWORD: ticketing
+      DB_NAME: ticketing
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 160
+      DEFAULT_POOL_SIZE: 40
+      RESERVE_POOL_SIZE: 0
+      QUERY_WAIT_TIMEOUT: 1
+    depends_on:
+      postgres: {condition: service_healthy}
+  redis:
+    image: redis:7.4.5-alpine
+    ports: ["127.0.0.1:6379:6379"]
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "256mb", "--maxmemory-policy", "noeviction"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  kafka:
+    image: apache/kafka:3.9.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_NUM_PARTITIONS: 6
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+    volumes: ["kafka-data:/var/lib/kafka/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
+      interval: 10s
+      timeout: 10s
+      retries: 20
+  migrate:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://ticketing:ticketing@postgres:5432/ticketing
+    command: ["python", "-m", "ticketing.cli", "migrate"]
+    depends_on:
+      postgres: {condition: service_healthy}
+  api:
+    <<: *app
+    ports: ["127.0.0.1:8000:8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+  publisher:
+    <<: *app
+    command: ["python", "-m", "ticketing.workers", "publisher"]
+  consumer:
+    <<: *app
+    command: ["python", "-m", "ticketing.workers", "consumer"]
+  reservation-writer:
+    <<: *app
+    command: ["python", "-m", "ticketing.workers", "reservation-writer"]
+  maintenance:
+    <<: *app
+    command: ["python", "-m", "ticketing.workers", "maintenance"]
+  refresh:
+    <<: *app
+    profiles: ["split-maintenance"]
+    environment:
+      <<: *env
+      DB_POOL_MAX: ${MAINTENANCE_POOL_MAX:-2}
+      SIMULATOR_CONCURRENCY: ${MAINTENANCE_SIMULATOR_CONCURRENCY:-2}
+    command: ["python", "-m", "ticketing.workers", "refresh"]
+  expiry:
+    <<: *app
+    profiles: ["split-maintenance"]
+    environment:
+      <<: *env
+      DB_POOL_MAX: ${MAINTENANCE_POOL_MAX:-2}
+      SIMULATOR_CONCURRENCY: ${MAINTENANCE_SIMULATOR_CONCURRENCY:-2}
+    command: ["python", "-m", "ticketing.workers", "expiry"]
+  reconciler:
+    <<: *app
+    command: ["python", "-m", "ticketing.workers", "reconciler"]
+  simulator:
+    <<: *app
+    command: ["python", "-m", "ticketing.workers", "simulator"]
+  seed:
+    <<: *app
+    restart: "no"
+    profiles: ["tools"]
+    command: ["python", "-m", "ticketing.cli", "seed"]
+  tests:
+    <<: *app
+    restart: "no"
+    profiles: ["test"]
+    environment:
+      <<: *env
+      TEST_DATABASE_URL: postgresql://ticketing:ticketing@postgres:5432/ticketing
+      TEST_REDIS_URL: redis://redis:6379/1
+      E2E_API_URL: http://api:8000
+      PYTEST_ADDOPTS: -o cache_dir=/tmp/pytest-cache
+    command: ["pytest", "-q"]
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    ports: ["127.0.0.1:9090:9090"]
+    volumes: ["./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+volumes:
+  postgres-data:
+  kafka-data:

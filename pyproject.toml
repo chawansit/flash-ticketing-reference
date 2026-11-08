@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-ticketing"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi>=0.115,<1", "uvicorn[standard]>=0.34,<1",
+  "psycopg[binary,pool]>=3.2,<4", "redis>=5.2,<7",
+  "kafka-python>=2.2,<3", "prometheus-client>=0.21,<1",
+  "PyJWT>=2.10,<3",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "httpx>=0.28,<1", "ruff>=0.11,<1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: requires running PostgreSQL and Redis", "e2e: requires running full Compose stack"]
+
+[tool.ruff]
+line-length = 110
+
